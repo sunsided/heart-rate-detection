@@ -1,8 +1,9 @@
-use nokhwa::pixel_format::RgbFormat;
+use nokhwa::pixel_format::{RgbAFormat, RgbFormat};
 use nokhwa::utils::{
-    CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
+    ApiBackend, CameraFormat, ControlValueSetter, FrameFormat, KnownCameraControl, RequestedFormat,
+    RequestedFormatType, Resolution,
 };
-use nokhwa::{Buffer, Camera, NokhwaError};
+use nokhwa::{nokhwa_initialize, Buffer, CallbackCamera, Camera, NokhwaError};
 use opencv::core::{mean, no_array, Rect, Scalar, Size, Vec3b, CV_8UC3};
 use opencv::highgui::{imshow, wait_key};
 use opencv::imgproc::{
@@ -11,6 +12,7 @@ use opencv::imgproc::{
 use opencv::objdetect::CascadeClassifier;
 use opencv::prelude::*;
 use opencv::types::VectorOfRect;
+use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
 const KEY_CODE_ESCAPE: i32 = 27;
@@ -18,21 +20,60 @@ const CASCADE_XML_FILE: &str = "haarcascade_frontalface_alt.xml";
 
 const CAMERA_CAPTURE_WIDTH: u32 = 640;
 const CAMERA_CAPTURE_HEIGHT: u32 = 480;
-const CAMERA_CAPTURE_IDEAL_FPS: u32 = 60;
+const CAMERA_CAPTURE_IDEAL_FPS: u32 = 30;
 
 // Reduced-size image dimensions for face detection
-const SCALE_FACTOR: f64 = 0.5_f64;
-const SCALE_FACTOR_INV: i32 = (1f64 / SCALE_FACTOR) as i32;
+const HAAR_SCALE_FACTOR: f64 = 0.5_f64;
+const HAAR_SCALE_FACTOR_INV: i32 = (1f64 / HAAR_SCALE_FACTOR) as i32;
+
+const HISTOGRAM_WIDTH: i32 = 640;
+const HISTOGRAM_HEIGHT: i32 = 100;
 
 fn main() {
+    // Only needs to be run on OSX.
+    nokhwa_initialize(|granted| {
+        println!("Camera initialization succeeded: {}", granted);
+    });
+
+    let cameras = nokhwa::query(ApiBackend::Auto).unwrap();
+    cameras.iter().for_each(|cam| println!("{:?}", cam));
+
     let mut classifier = CascadeClassifier::new(CASCADE_XML_FILE).unwrap();
+    let camera = cameras.last().unwrap();
 
-    let index = CameraIndex::Index(0);
-    let mut camera = get_camera(index).unwrap();
-    let (mut capture_buffer, mut bgr_buffer) = prepare_buffers(&mut camera);
+    let format = CameraFormat::new(
+        Resolution::new(CAMERA_CAPTURE_WIDTH, CAMERA_CAPTURE_HEIGHT),
+        FrameFormat::YUYV,
+        CAMERA_CAPTURE_IDEAL_FPS,
+    );
 
-    const HISTOGRAM_WIDTH: i32 = 640;
-    const HISTOGRAM_HEIGHT: i32 = 100;
+    let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(format));
+
+    let mut threaded = CallbackCamera::new(camera.index().clone(), format, |buffer| {
+        // TODO: Use RGBA? Could be faster.
+        /*let mut image = buffer.decode_image::<RgbFormat>().unwrap();
+        let capture_buffer = unsafe {
+            Mat::new_rows_cols_with_data(
+                image.height() as _,
+                image.width() as _,
+                CV_8UC3,
+                image.as_mut_ptr() as *mut c_void,
+                0,
+            )
+        }
+        .unwrap();
+        */
+
+        println!("Cough");
+
+        // decode_to_bgr(buffer, &mut capture_buffer, &mut bgr_buffer);
+    })
+    .unwrap();
+
+    threaded.open_stream().unwrap();
+
+    let resolution = threaded.resolution().unwrap();
+    let (mut capture_buffer, mut bgr_buffer) = prepare_buffers(&resolution).unwrap();
 
     let mut histogram_buffer = Mat::new_rows_cols_with_default(
         HISTOGRAM_HEIGHT,
@@ -48,9 +89,6 @@ fn main() {
     let mut face: Option<Rect> = None;
 
     loop {
-        let frame = camera.frame().unwrap();
-        decode_to_bgr(frame, &mut capture_buffer, &mut bgr_buffer);
-
         if face.is_none() {
             let preprocessed = preprocess_image(&bgr_buffer).unwrap();
             let faces = detect_faces(&mut classifier, preprocessed).unwrap();
@@ -123,31 +161,29 @@ fn main() {
             }
         }
     }
+
+    println!("Stopping camera stream ...");
+    threaded.stop_stream().unwrap();
+    drop(threaded);
+
+    println!("Bye.");
 }
 
-fn get_camera(index: CameraIndex) -> Result<Camera, NokhwaError> {
-    // TODO: Use threaded camera
-    let format = CameraFormat::new(
-        Resolution::new(CAMERA_CAPTURE_WIDTH, CAMERA_CAPTURE_HEIGHT),
-        FrameFormat::MJPEG,
-        CAMERA_CAPTURE_IDEAL_FPS,
-    );
-    let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(format));
-    let mut camera = Camera::new(index, requested)?;
-    camera.open_stream()?;
-    Ok(camera)
-}
-
-fn prepare_buffers(camera: &mut Camera) -> (Mat, Mat) {
-    let resolution = camera.resolution();
-    let capture_buffer =
-        unsafe { Mat::new_rows_cols(resolution.height() as _, resolution.width() as _, CV_8UC3) }
-            .unwrap();
-
-    let bgr_buffer =
-        unsafe { Mat::new_rows_cols(resolution.height() as _, resolution.width() as _, CV_8UC3) }
-            .unwrap();
-    (capture_buffer, bgr_buffer)
+fn prepare_buffers(resolution: &Resolution) -> Result<(Mat, Mat), opencv::Error> {
+    let capture_buffer = Mat::new_rows_cols_with_default(
+        resolution.height() as _,
+        resolution.width() as _,
+        CV_8UC3,
+        Scalar::default(),
+    )?;
+    let bgr_buffer = Mat::new_rows_cols_with_default(
+        resolution.height() as _,
+        resolution.width() as _,
+        CV_8UC3,
+        Scalar::default(),
+    )
+    .unwrap();
+    Ok((capture_buffer, bgr_buffer))
 }
 
 fn decode_to_bgr(frame: Buffer, capture_buffer: &mut Mat, dst: &mut Mat) {
@@ -162,7 +198,7 @@ fn decode_to_bgr(frame: Buffer, capture_buffer: &mut Mat, dst: &mut Mat) {
 
 fn preprocess_image(frame: &Mat) -> Result<Mat, opencv::Error> {
     let gray = convert_to_grayscale(frame)?;
-    let reduced = reduce_image_size(&gray, SCALE_FACTOR)?;
+    let reduced = reduce_image_size(&gray, HAAR_SCALE_FACTOR)?;
     equalize_image(&reduced)
 }
 
@@ -227,15 +263,15 @@ fn detect_faces(
 
 fn draw_box_around_face(frame: &mut Mat, face: Rect) -> Result<Rect, opencv::Error> {
     // Trim the face width down a bit.
-    let scaled_width = ((face.width * SCALE_FACTOR_INV) as f32 * 0.8) as _;
-    let width_delta = (face.width * SCALE_FACTOR_INV) - scaled_width;
+    let scaled_width = ((face.width * HAAR_SCALE_FACTOR_INV) as f32 * 0.8) as _;
+    let width_delta = (face.width * HAAR_SCALE_FACTOR_INV) - scaled_width;
     let half_width_delta = width_delta / 2;
 
     let scaled_face = Rect {
-        x: face.x * SCALE_FACTOR_INV + half_width_delta,
-        y: face.y * SCALE_FACTOR_INV,
+        x: face.x * HAAR_SCALE_FACTOR_INV + half_width_delta,
+        y: face.y * HAAR_SCALE_FACTOR_INV,
         width: scaled_width,
-        height: face.height * SCALE_FACTOR_INV,
+        height: face.height * HAAR_SCALE_FACTOR_INV,
     };
 
     const THICKNESS: i32 = 2;

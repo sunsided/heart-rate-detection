@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-nokhwa = { version = "0.10.4", features = ["input-native"] }
+nokhwa = { version = "0.10.4", features = ["input-native", "output-threaded"] }
 opencv = { version = "0.84.2", default-features = false, features = ["imgproc", "highgui", "clang-runtime", "objdetect"] }
 
 [profile.dev.package."*"]
