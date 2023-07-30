@@ -41,6 +41,9 @@ const IOU_THRESHOLD: f32 = 0.8;
 
 // TODO: Impractical but fun: Use optical flow to adjust the detected face until the next guess comes in.
 
+// TODO: Heart Rate Variability (~55 to ~105 ms variability for teenagers, ~25 to ~45 for older people)
+// TODO: Interbeat Interval (IBI)
+
 fn main() {
     let palette = colorgrad::turbo();
 
