@@ -11,6 +11,7 @@ use opencv::imgproc::{
 use opencv::objdetect::CascadeClassifier;
 use opencv::prelude::*;
 use opencv::types::VectorOfRect;
+use ruststft::{WindowType, STFT};
 use std::time::{Duration, Instant};
 
 const KEY_CODE_ESCAPE: i32 = 27;
@@ -24,26 +25,62 @@ const CAMERA_CAPTURE_IDEAL_FPS: u32 = 30;
 const SCALE_FACTOR: f64 = 0.5_f64;
 const SCALE_FACTOR_INV: i32 = (1f64 / SCALE_FACTOR) as i32;
 
+const HISTOGRAM_WIDTH: i32 = 640;
+const HISTOGRAM_HEIGHT: i32 = 100;
+
+const STFT_WINDOW_SIZE: usize = 4 * (HISTOGRAM_WIDTH as usize);
+const STFT_STEP_SIZE: usize = 15;
+
+const IOU_THRESHOLD: f32 = 0.8;
+
+// TODO: Grab webcam frames in a thread. Ignore double-buffering, just allocate every time.
+// TODO: Start with a rectangle in the center of the image as the initial guess for the face.
+// TODO: Run haar cascades on another thread every once in a while. Update the region of interest.
+// TODO: Sample-and-hold for the FFT.
+// TODO: Run the FFT in a separate thread.
+
+// TODO: Impractical but fun: Use optical flow to adjust the detected face until the next guess comes in.
+
 fn main() {
+    let palette = colorgrad::turbo();
+
     let mut classifier = CascadeClassifier::new(CASCADE_XML_FILE).unwrap();
+
+    let window_type = WindowType::Hanning;
+    let window_size: usize = STFT_WINDOW_SIZE;
+    let step_size: usize = STFT_STEP_SIZE;
+    let mut stft = STFT::new(window_type, window_size, step_size);
+
+    let mut spectrogram_column: Vec<f64> = std::iter::repeat(0.).take(stft.output_size()).collect();
+    // assert_eq!(spectrogram_column.len(), HISTOGRAM_WIDTH as _);
+
+    // pre-fill
+    stft.append_samples(&vec![0.0; STFT_WINDOW_SIZE]);
 
     let index = CameraIndex::Index(0);
     let mut camera = get_camera(index).unwrap();
     let (mut capture_buffer, mut bgr_buffer) = prepare_buffers(&mut camera);
 
-    const HISTOGRAM_WIDTH: i32 = 640;
-    const HISTOGRAM_HEIGHT: i32 = 100;
-
     let mut histogram_buffer = Mat::new_rows_cols_with_default(
         HISTOGRAM_HEIGHT,
         HISTOGRAM_WIDTH,
         CV_8UC3,
-        Scalar::all(255.0),
+        Scalar::all(0.0),
     )
     .unwrap();
 
     let mut display_delay = Instant::now();
-    let mut detect_delay = Instant::now();
+    let mut sample_delay = Instant::now();
+    let mut sample = 0.0;
+    let mut last_region = Rect::default();
+
+    let mut min_hist = 0.0;
+    let mut max_hist = 0.0;
+
+    let mut last_detection = None;
+
+    let color_red = Scalar::new(0.0, 0.0, 255.0, -1.0);
+    let color_green = Scalar::new(0.0, 255.0, 0.0, -1.0);
 
     loop {
         let frame = camera.frame().unwrap();
@@ -52,51 +89,86 @@ fn main() {
         let preprocessed = preprocess_image(&bgr_buffer).unwrap();
         let faces = detect_faces(&mut classifier, preprocessed).unwrap();
 
+        let mut color = color_red;
         if let Some(region) = faces.into_iter().next() {
-            let rect = draw_box_around_face(&mut bgr_buffer, region).unwrap();
+            last_detection = Some(region);
+            color = color_green;
+        }
+
+        if let Some(region) = last_detection {
+            let iou = calculate_iou(&region, &last_region);
+            if iou < IOU_THRESHOLD {
+                last_region = region.clone();
+            }
+
+            let rect = draw_box_around_face(&mut bgr_buffer, &last_region, &color).unwrap();
             let roi = Mat::roi(&bgr_buffer, rect).unwrap();
             let mean = mean(&roi, &no_array()).unwrap();
 
-            let fps = 1.0 / (Instant::now() - detect_delay).as_secs_f64();
-            detect_delay = Instant::now();
-            println!("FPS: {}", fps);
-
-            let mean = mean * (HISTOGRAM_HEIGHT as f64 / 255.0);
-
-            let b = mean[0] as i32;
-            let g = mean[1] as i32;
-            let r = mean[2] as i32;
-
-            if let Ok(pixel) = histogram_buffer.at_2d_mut::<Vec3b>(HISTOGRAM_HEIGHT - b, 10) {
-                pixel[0] = 255;
-                pixel[1] = 0;
-                pixel[2] = 0;
-            }
-
-            if let Ok(pixel) = histogram_buffer.at_2d_mut::<Vec3b>(HISTOGRAM_HEIGHT - g, 10) {
-                pixel[0] = 0;
-                pixel[1] = 255;
-                pixel[2] = 0;
-            }
-
-            if let Ok(pixel) = histogram_buffer.at_2d_mut::<Vec3b>(HISTOGRAM_HEIGHT - r, 10) {
-                pixel[0] = 0;
-                pixel[1] = 0;
-                pixel[2] = 255;
-            }
+            // Sample and hold.
+            sample = mean[1] / 255.0;
         }
 
-        let src = Mat::roi(
-            &histogram_buffer,
-            Rect::new(0, 0, HISTOGRAM_WIDTH - 1, HISTOGRAM_HEIGHT),
-        )
-        .unwrap();
-        let mut dst = Mat::roi(
-            &histogram_buffer,
-            Rect::new(1, 0, HISTOGRAM_WIDTH - 1, HISTOGRAM_HEIGHT),
-        )
-        .unwrap();
-        src.copy_to(&mut dst).unwrap();
+        let tbf = Instant::now() - sample_delay;
+        if tbf.as_millis() >= 60 {
+            let fps = 1.0 / tbf.as_secs_f64();
+            sample_delay = Instant::now();
+            println!("x FPS: {} ({:?})", fps, tbf);
+
+            stft.append_samples(&[sample]);
+
+            while stft.contains_enough_to_compute() {
+                stft.compute_column(&mut spectrogram_column[..]);
+                stft.move_to_next_column();
+
+                let row = histogram_buffer
+                    .at_row_mut::<Vec3b>(HISTOGRAM_HEIGHT - 1)
+                    .unwrap();
+
+                let mut min = f64::MAX;
+                let mut max = f64::MIN;
+
+                for &value in &spectrogram_column {
+                    min = min.min(value);
+                    max = max.max(value);
+                }
+
+                if max <= 1e-4 {
+                    max = 1.0;
+                }
+
+                min = min * 0.9 + min_hist * 0.1;
+                max = max * 0.9 + max_hist * 0.1;
+
+                min_hist = min;
+                max_hist = max;
+
+                println!("min={min}, max={max}");
+
+                const SKIP: usize = 10;
+                const N: usize = HISTOGRAM_WIDTH as usize - SKIP;
+                for (i, &value) in spectrogram_column.iter().skip(SKIP).take(N).enumerate() {
+                    let sample = ((value - min) / max + min).min(1.0);
+                    let color = palette.at(sample);
+                    let rgb = color.to_rgba8();
+
+                    let j = ((i as f64) / (N as f64) * (HISTOGRAM_WIDTH as f64)) as usize;
+                    row[j] = Vec3b::from_array([rgb[2], rgb[1], rgb[0]]);
+                }
+            }
+
+            let src = Mat::roi(
+                &histogram_buffer,
+                Rect::new(0, 1, HISTOGRAM_WIDTH, HISTOGRAM_HEIGHT - 1),
+            )
+            .unwrap();
+            let mut dst = Mat::roi(
+                &histogram_buffer,
+                Rect::new(0, 0, HISTOGRAM_WIDTH, HISTOGRAM_HEIGHT - 1),
+            )
+            .unwrap();
+            src.copy_to(&mut dst).unwrap();
+        }
 
         let mut histogram_region = Mat::roi(
             &bgr_buffer,
@@ -120,6 +192,24 @@ fn main() {
             }
         }
     }
+}
+
+fn calculate_iou(r1: &Rect, r2: &Rect) -> f32 {
+    let x_overlap = f32::max(
+        0.0,
+        f32::min((r1.x + r1.width) as f32, (r2.x + r2.width) as f32)
+            - f32::max(r1.x as f32, r2.x as f32),
+    );
+    let y_overlap = f32::max(
+        0.0,
+        f32::min((r1.y + r1.height) as f32, (r2.y + r2.height) as f32)
+            - f32::max(r1.y as f32, r2.y as f32),
+    );
+    let intersection_area = x_overlap * y_overlap;
+    let union_area =
+        r1.width as f32 * r1.height as f32 + r2.width as f32 * r2.height as f32 - intersection_area;
+
+    intersection_area / union_area
 }
 
 fn get_camera(index: CameraIndex) -> Result<Camera, NokhwaError> {
@@ -222,7 +312,11 @@ fn detect_faces(
     Ok(faces)
 }
 
-fn draw_box_around_face(frame: &mut Mat, face: Rect) -> Result<Rect, opencv::Error> {
+fn draw_box_around_face(
+    frame: &mut Mat,
+    face: &Rect,
+    color: &Scalar,
+) -> Result<Rect, opencv::Error> {
     // Trim the face width down a bit.
     let scaled_width = ((face.width * SCALE_FACTOR_INV) as f32 * 0.8) as _;
     let width_delta = (face.width * SCALE_FACTOR_INV) - scaled_width;
@@ -238,8 +332,14 @@ fn draw_box_around_face(frame: &mut Mat, face: Rect) -> Result<Rect, opencv::Err
     const THICKNESS: i32 = 2;
     const LINE_TYPE: i32 = 8;
     const SHIFT: i32 = 0;
-    let color_red = Scalar::new(0f64, 0f64, 255f64, -1f64);
 
-    rectangle(frame, scaled_face, color_red, THICKNESS, LINE_TYPE, SHIFT)?;
+    rectangle(
+        frame,
+        scaled_face,
+        color.clone(),
+        THICKNESS,
+        LINE_TYPE,
+        SHIFT,
+    )?;
     Ok(scaled_face)
 }
