@@ -18,7 +18,7 @@ const CASCADE_XML_FILE: &str = "haarcascade_frontalface_alt.xml";
 
 const CAMERA_CAPTURE_WIDTH: u32 = 640;
 const CAMERA_CAPTURE_HEIGHT: u32 = 480;
-const CAMERA_CAPTURE_IDEAL_FPS: u32 = 60;
+const CAMERA_CAPTURE_IDEAL_FPS: u32 = 30;
 
 // Reduced-size image dimensions for face detection
 const SCALE_FACTOR: f64 = 0.5_f64;
@@ -45,19 +45,14 @@ fn main() {
     let mut display_delay = Instant::now();
     let mut detect_delay = Instant::now();
 
-    let mut face: Option<Rect> = None;
-
     loop {
         let frame = camera.frame().unwrap();
         decode_to_bgr(frame, &mut capture_buffer, &mut bgr_buffer);
 
-        if face.is_none() {
-            let preprocessed = preprocess_image(&bgr_buffer).unwrap();
-            let faces = detect_faces(&mut classifier, preprocessed).unwrap();
-            face = faces.into_iter().next();
-        }
+        let preprocessed = preprocess_image(&bgr_buffer).unwrap();
+        let faces = detect_faces(&mut classifier, preprocessed).unwrap();
 
-        if let Some(region) = face.clone() {
+        if let Some(region) = faces.into_iter().next() {
             let rect = draw_box_around_face(&mut bgr_buffer, region).unwrap();
             let roi = Mat::roi(&bgr_buffer, rect).unwrap();
             let mean = mean(&roi, &no_array()).unwrap();
@@ -66,9 +61,11 @@ fn main() {
             detect_delay = Instant::now();
             println!("FPS: {}", fps);
 
-            let b = (mean[0] * (HISTOGRAM_HEIGHT as f64 / 255.0)) as i32;
-            let g = (mean[1] * (HISTOGRAM_HEIGHT as f64 / 255.0)) as i32;
-            let r = (mean[2] * (HISTOGRAM_HEIGHT as f64 / 255.0)) as i32;
+            let mean = mean * (HISTOGRAM_HEIGHT as f64 / 255.0);
+
+            let b = mean[0] as i32;
+            let g = mean[1] as i32;
+            let r = mean[2] as i32;
 
             if let Ok(pixel) = histogram_buffer.at_2d_mut::<Vec3b>(HISTOGRAM_HEIGHT - b, 10) {
                 pixel[0] = 255;
