@@ -7,4 +7,7 @@ edition = "2021"
 
 [dependencies]
 nokhwa = { version = "0.10.4", features = ["input-native"] }
-opencv = { version = "0.84.2", default-features = false, features = ["imgproc", "highgui", "clang-runtime"] }
+opencv = { version = "0.84.2", default-features = false, features = ["imgproc", "highgui", "clang-runtime", "objdetect"] }
+
+[profile.dev.package."*"]
+opt-level = 3
