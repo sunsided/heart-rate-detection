@@ -23,6 +23,10 @@ impl FpsCounter {
         }
 
         self.buffer.push_back(now);
+        if self.buffer.len() == 1 {
+            return 0.0;
+        }
+
         let (sum, count) = self
             .buffer
             .iter()
