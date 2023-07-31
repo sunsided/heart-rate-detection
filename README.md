@@ -1,4 +1,4 @@
-# Heart Rate Monitoring through Color Channel Analysis
+# Remote Photoplethysmography (rPPG) / Heart Rate Monitoring through Color Channel Analysis
 
 An experiment in measuring heart beat rates by observing color channel variations over time.
 

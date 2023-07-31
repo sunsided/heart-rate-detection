@@ -105,7 +105,8 @@ fn main() {
             let mean = mean(&roi, &no_array()).unwrap();
 
             // Sample and hold.
-            let sample = mean[1] / 255.0;
+            // let sample = mean[1] / 255.0;
+            let sample = (mean[0] + mean[1] + mean[2]) / (255.0 * 3.0);
 
             // Keep a moving average range.
             if sample_history.len() == sample_history_length {
