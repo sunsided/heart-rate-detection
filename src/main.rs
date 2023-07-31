@@ -1,21 +1,16 @@
 mod camera;
+mod face_detector;
 mod fps_counter;
 
 use crate::camera::{CameraCapture, FrameNotification};
-use nokhwa::pixel_format::RgbFormat;
-use nokhwa::utils::{
-    CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
-};
-use nokhwa::{Buffer, Camera, NokhwaError};
-use opencv::core::{mean, no_array, Rect, Scalar, Size, Vec3b, CV_8UC3};
+use crate::face_detector::FaceDetector;
+use nokhwa::utils::CameraIndex;
+use opencv::core::{mean, no_array, Rect, Scalar, Vec3b, CV_8UC3};
 use opencv::highgui::{imshow, wait_key};
-use opencv::imgproc::{
-    cvt_color, equalize_hist, rectangle, resize, COLOR_BGR2GRAY, COLOR_RGB2BGR, INTER_LINEAR,
-};
-use opencv::objdetect::CascadeClassifier;
+use opencv::imgproc::rectangle;
 use opencv::prelude::*;
-use opencv::types::VectorOfRect;
 use ruststft::{WindowType, STFT};
+use std::path::PathBuf;
 use std::sync;
 use std::time::{Duration, Instant};
 
@@ -38,8 +33,6 @@ const STFT_STEP_SIZE: usize = 15;
 
 const IOU_THRESHOLD: f32 = 0.8;
 
-// TODO: Start with a rectangle in the center of the image as the initial guess for the face.
-// TODO: Run haar cascades on another thread every once in a while. Update the region of interest.
 // TODO: Sample-and-hold for the FFT.
 // TODO: Run the FFT in a separate thread.
 
@@ -50,8 +43,7 @@ const IOU_THRESHOLD: f32 = 0.8;
 
 fn main() {
     let palette = colorgrad::turbo();
-
-    let mut classifier = CascadeClassifier::new(CASCADE_XML_FILE).unwrap();
+    let face_detector = FaceDetector::new(&PathBuf::from(CASCADE_XML_FILE));
 
     let window_type = WindowType::Hanning;
     let window_size: usize = STFT_WINDOW_SIZE;
@@ -101,23 +93,23 @@ fn main() {
             Some(frame) => frame,
         };
 
-        let preprocessed = preprocess_image(&bgr_buffer).unwrap();
-        let faces = detect_faces(&mut classifier, preprocessed).unwrap();
+        face_detector.provide_image(&bgr_buffer);
 
-        let mut color = color_red;
-        if let Some(region) = faces.into_iter().next() {
-            last_detection = Some(region);
-            color = color_green;
-        }
+        let color = match face_detector.face() {
+            None => color_red,
+            Some((true, region)) => {
+                last_detection = Some(region);
+                color_green
+            }
+            Some((false, region)) => {
+                last_detection = Some(region);
+                color_red
+            }
+        };
 
         if let Some(region) = last_detection {
-            let iou = calculate_iou(&region, &last_region);
-            if iou < IOU_THRESHOLD {
-                last_region = region.clone();
-            }
-
-            let rect = draw_box_around_face(&mut bgr_buffer, &last_region, &color).unwrap();
-            let roi = Mat::roi(&bgr_buffer, rect).unwrap();
+            draw_box_around_face(&mut bgr_buffer, region.clone(), &color).unwrap();
+            let roi = Mat::roi(&bgr_buffer, region).unwrap();
             let mean = mean(&roi, &no_array()).unwrap();
 
             // Sample and hold.
@@ -209,152 +201,11 @@ fn main() {
     }
 }
 
-fn calculate_iou(r1: &Rect, r2: &Rect) -> f32 {
-    let x_overlap = f32::max(
-        0.0,
-        f32::min((r1.x + r1.width) as f32, (r2.x + r2.width) as f32)
-            - f32::max(r1.x as f32, r2.x as f32),
-    );
-    let y_overlap = f32::max(
-        0.0,
-        f32::min((r1.y + r1.height) as f32, (r2.y + r2.height) as f32)
-            - f32::max(r1.y as f32, r2.y as f32),
-    );
-    let intersection_area = x_overlap * y_overlap;
-    let union_area =
-        r1.width as f32 * r1.height as f32 + r2.width as f32 * r2.height as f32 - intersection_area;
-
-    intersection_area / union_area
-}
-
-fn get_camera(index: CameraIndex) -> Result<Camera, NokhwaError> {
-    // TODO: Use threaded camera
-    let format = CameraFormat::new(
-        Resolution::new(CAMERA_CAPTURE_WIDTH, CAMERA_CAPTURE_HEIGHT),
-        FrameFormat::MJPEG,
-        CAMERA_CAPTURE_IDEAL_FPS,
-    );
-    let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(format));
-    let mut camera = Camera::new(index, requested)?;
-    camera.open_stream()?;
-    Ok(camera)
-}
-
-fn prepare_buffers(camera: &mut Camera) -> (Mat, Mat) {
-    let resolution = camera.resolution();
-    let capture_buffer =
-        unsafe { Mat::new_rows_cols(resolution.height() as _, resolution.width() as _, CV_8UC3) }
-            .unwrap();
-
-    let bgr_buffer =
-        unsafe { Mat::new_rows_cols(resolution.height() as _, resolution.width() as _, CV_8UC3) }
-            .unwrap();
-    (capture_buffer, bgr_buffer)
-}
-
-fn decode_to_bgr(frame: Buffer, capture_buffer: &mut Mat, dst: &mut Mat) {
-    let mut decoded = frame.decode_image::<RgbFormat>().unwrap();
-
-    unsafe {
-        capture_buffer.set_data(decoded.as_mut_ptr());
-    }
-
-    cvt_color(capture_buffer, dst, COLOR_RGB2BGR, 3).unwrap();
-}
-
-fn preprocess_image(frame: &Mat) -> Result<Mat, opencv::Error> {
-    let gray = convert_to_grayscale(frame)?;
-    let reduced = reduce_image_size(&gray, SCALE_FACTOR)?;
-    equalize_image(&reduced)
-}
-
-fn convert_to_grayscale(frame: &Mat) -> Result<Mat, opencv::Error> {
-    let mut gray = Mat::default();
-    cvt_color(frame, &mut gray, COLOR_BGR2GRAY, 0)?;
-    Ok(gray)
-}
-
-fn reduce_image_size(image: &Mat, factor: f64) -> Result<Mat, opencv::Error> {
-    // Destination size is determined by scaling `factor`, not by target size.
-    const SIZE_AUTO: Size = Size {
-        width: 0,
-        height: 0,
-    };
-    let mut reduced = Mat::default();
-    resize(
-        image,
-        &mut reduced,
-        SIZE_AUTO,
-        factor, // fx
-        factor, // fy
-        INTER_LINEAR,
-    )?;
-    Ok(reduced)
-}
-
-fn equalize_image(reduced: &Mat) -> Result<Mat, opencv::Error> {
-    let mut equalized = Mat::default();
-    equalize_hist(reduced, &mut equalized)?;
-    Ok(equalized)
-}
-
-fn detect_faces(
-    classifier: &mut CascadeClassifier,
-    image: Mat,
-) -> Result<VectorOfRect, opencv::Error> {
-    const SCALE_FACTOR: f64 = 1.1;
-    const MIN_NEIGHBORS: i32 = 2;
-    const FLAGS: i32 = 0;
-    const MIN_FACE_SIZE: Size = Size {
-        width: 30,
-        height: 30,
-    };
-    const MAX_FACE_SIZE: Size = Size {
-        width: 0,
-        height: 0,
-    };
-
-    let mut faces = VectorOfRect::new();
-    classifier.detect_multi_scale(
-        &image,
-        &mut faces,
-        SCALE_FACTOR,
-        MIN_NEIGHBORS,
-        FLAGS,
-        MIN_FACE_SIZE,
-        MAX_FACE_SIZE,
-    )?;
-    Ok(faces)
-}
-
-fn draw_box_around_face(
-    frame: &mut Mat,
-    face: &Rect,
-    color: &Scalar,
-) -> Result<Rect, opencv::Error> {
-    // Trim the face width down a bit.
-    let scaled_width = ((face.width * SCALE_FACTOR_INV) as f32 * 0.8) as _;
-    let width_delta = (face.width * SCALE_FACTOR_INV) - scaled_width;
-    let half_width_delta = width_delta / 2;
-
-    let scaled_face = Rect {
-        x: face.x * SCALE_FACTOR_INV + half_width_delta,
-        y: face.y * SCALE_FACTOR_INV,
-        width: scaled_width,
-        height: face.height * SCALE_FACTOR_INV,
-    };
-
+fn draw_box_around_face(frame: &mut Mat, face: Rect, color: &Scalar) -> Result<(), opencv::Error> {
     const THICKNESS: i32 = 2;
     const LINE_TYPE: i32 = 8;
     const SHIFT: i32 = 0;
 
-    rectangle(
-        frame,
-        scaled_face,
-        color.clone(),
-        THICKNESS,
-        LINE_TYPE,
-        SHIFT,
-    )?;
-    Ok(scaled_face)
+    rectangle(frame, face, color.clone(), THICKNESS, LINE_TYPE, SHIFT)?;
+    Ok(())
 }
