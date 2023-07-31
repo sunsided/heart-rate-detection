@@ -2,6 +2,8 @@
 
 An experiment in measuring heart beat rates by observing color channel variations over time.
 
+Not working yet.
+
 ![](images/test.jpg)
 
 ## Interbeat Interval (IBI) and Heart Rate Variability (HRV)
