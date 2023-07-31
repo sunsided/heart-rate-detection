@@ -1,3 +1,7 @@
+mod camera;
+mod fps_counter;
+
+use crate::camera::{CameraCapture, FrameNotification};
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{
     CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
@@ -12,6 +16,7 @@ use opencv::objdetect::CascadeClassifier;
 use opencv::prelude::*;
 use opencv::types::VectorOfRect;
 use ruststft::{WindowType, STFT};
+use std::sync;
 use std::time::{Duration, Instant};
 
 const KEY_CODE_ESCAPE: i32 = 27;
@@ -33,7 +38,6 @@ const STFT_STEP_SIZE: usize = 15;
 
 const IOU_THRESHOLD: f32 = 0.8;
 
-// TODO: Grab webcam frames in a thread. Ignore double-buffering, just allocate every time.
 // TODO: Start with a rectangle in the center of the image as the initial guess for the face.
 // TODO: Run haar cascades on another thread every once in a while. Update the region of interest.
 // TODO: Sample-and-hold for the FFT.
@@ -60,9 +64,10 @@ fn main() {
     // pre-fill
     stft.append_samples(&vec![0.0; STFT_WINDOW_SIZE]);
 
+    let (notify_sender, new_frame_notification) = sync::mpsc::sync_channel(1);
+
     let index = CameraIndex::Index(0);
-    let mut camera = get_camera(index).unwrap();
-    let (mut capture_buffer, mut bgr_buffer) = prepare_buffers(&mut camera);
+    let camera = CameraCapture::try_new_from_index(index, notify_sender).unwrap();
 
     let mut histogram_buffer = Mat::new_rows_cols_with_default(
         HISTOGRAM_HEIGHT,
@@ -85,9 +90,16 @@ fn main() {
     let color_red = Scalar::new(0.0, 0.0, 255.0, -1.0);
     let color_green = Scalar::new(0.0, 255.0, 0.0, -1.0);
 
-    loop {
-        let frame = camera.frame().unwrap();
-        decode_to_bgr(frame, &mut capture_buffer, &mut bgr_buffer);
+    while let Ok(FrameNotification::NewFrame { fps }) = new_frame_notification.recv() {
+        println!("Camera FPS: {fps}");
+
+        let mut bgr_buffer = match camera.frame() {
+            None => {
+                eprintln!("Got an empty buffer");
+                continue;
+            }
+            Some(frame) => frame,
+        };
 
         let preprocessed = preprocess_image(&bgr_buffer).unwrap();
         let faces = detect_faces(&mut classifier, preprocessed).unwrap();

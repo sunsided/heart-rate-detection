@@ -394,6 +394,7 @@ dependencies = [
  "nokhwa",
  "opencv",
  "ruststft",
+ "thiserror",
 ]
 
 [[package]]
