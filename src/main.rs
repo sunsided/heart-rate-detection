@@ -59,7 +59,7 @@ fn main() {
 
     let histogram_background = palette.at(0.0).to_rgba8();
 
-    let mut histogram_buffer = Mat::new_rows_cols_with_default(
+    let mut spectrogram_buffer = Mat::new_rows_cols_with_default(
         HISTOGRAM_HEIGHT,
         HISTOGRAM_WIDTH,
         CV_8UC3,
@@ -158,7 +158,7 @@ fn main() {
         update_spectrogram_display(
             &palette,
             &sample_spectrogram,
-            &mut histogram_buffer,
+            &mut spectrogram_buffer,
             &mut sample_delay,
             &mut min_hist,
             &mut max_hist,
@@ -166,7 +166,7 @@ fn main() {
             max_idx,
         );
 
-        let mut histogram_region = Mat::roi(
+        let mut spectrogram_region = Mat::roi(
             &bgr_buffer,
             Rect::new(
                 0,
@@ -177,7 +177,7 @@ fn main() {
         )
         .unwrap();
 
-        histogram_buffer.copy_to(&mut histogram_region).unwrap();
+        spectrogram_buffer.copy_to(&mut spectrogram_region).unwrap();
 
         if Instant::now() - display_delay > Duration::from_millis(30) {
             display_delay = Instant::now();
@@ -193,7 +193,7 @@ fn main() {
 fn update_spectrogram_display(
     palette: &Gradient,
     sample_spectrogram: &SampleSpectrogram,
-    mut histogram_buffer: &mut Mat,
+    mut spectrogram_buffer: &mut Mat,
     sample_delay: &mut Instant,
     min_hist: &mut f64,
     max_hist: &mut f64,
@@ -207,7 +207,7 @@ fn update_spectrogram_display(
         let mut spectrogram_column = Vec::new();
         sample_spectrogram.copy_spectrogram_into(&mut spectrogram_column);
 
-        let row = histogram_buffer
+        let row = spectrogram_buffer
             .at_row_mut::<Vec3b>(HISTOGRAM_HEIGHT - 1)
             .unwrap();
 
@@ -248,7 +248,7 @@ fn update_spectrogram_display(
             row[j] = Vec3b::from_array([rgb[2], rgb[1], rgb[0]]);
         }
 
-        shift_spectrogram(&mut histogram_buffer);
+        shift_spectrogram(&mut spectrogram_buffer);
     }
 }
 
