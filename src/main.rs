@@ -1,15 +1,19 @@
 mod camera;
 mod face_detector;
 mod fps_counter;
+mod sample_spectrogram;
 
 use crate::camera::{CameraCapture, FrameNotification};
 use crate::face_detector::FaceDetector;
+use crate::sample_spectrogram::SampleSpectrogram;
+use colorgrad::Gradient;
 use nokhwa::utils::CameraIndex;
 use opencv::core::{mean, no_array, Rect, Scalar, Vec3b, CV_8UC3};
 use opencv::highgui::{imshow, wait_key};
-use opencv::imgproc::rectangle;
+use opencv::imgproc::{rectangle, FILLED, LINE_4};
 use opencv::prelude::*;
-use ruststft::{WindowType, STFT};
+use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync;
 use std::time::{Duration, Instant};
@@ -28,13 +32,10 @@ const SCALE_FACTOR_INV: i32 = (1f64 / SCALE_FACTOR) as i32;
 const HISTOGRAM_WIDTH: i32 = 640;
 const HISTOGRAM_HEIGHT: i32 = 100;
 
-const STFT_WINDOW_SIZE: usize = 4 * (HISTOGRAM_WIDTH as usize);
-const STFT_STEP_SIZE: usize = 15;
-
 const IOU_THRESHOLD: f32 = 0.8;
 
-// TODO: Sample-and-hold for the FFT.
-// TODO: Run the FFT in a separate thread.
+const MIN_IBI_FREQ: f64 = 0.5;
+const MAX_IBI_FREQ: f64 = 10.0;
 
 // TODO: Impractical but fun: Use optical flow to adjust the detected face until the next guess comes in.
 
@@ -45,34 +46,35 @@ fn main() {
     let palette = colorgrad::turbo();
     let face_detector = FaceDetector::new(&PathBuf::from(CASCADE_XML_FILE));
 
-    let window_type = WindowType::Hanning;
-    let window_size: usize = STFT_WINDOW_SIZE;
-    let step_size: usize = STFT_STEP_SIZE;
-    let mut stft = STFT::new(window_type, window_size, step_size);
+    let sample_spectrogram = SampleSpectrogram::new();
+    let frequencies = sample_spectrogram.frequencies();
 
-    let mut spectrogram_column: Vec<f64> = std::iter::repeat(0.).take(stft.output_size()).collect();
-    // assert_eq!(spectrogram_column.len(), HISTOGRAM_WIDTH as _);
-
-    // pre-fill
-    stft.append_samples(&vec![0.0; STFT_WINDOW_SIZE]);
+    let min_idx = frequencies.iter().position(|&v| v >= MIN_IBI_FREQ).unwrap();
+    let max_idx = frequencies.iter().position(|&v| v >= MAX_IBI_FREQ).unwrap();
 
     let (notify_sender, new_frame_notification) = sync::mpsc::sync_channel(1);
 
     let index = CameraIndex::Index(0);
     let camera = CameraCapture::try_new_from_index(index, notify_sender).unwrap();
 
+    let histogram_background = palette.at(0.0).to_rgba8();
+
     let mut histogram_buffer = Mat::new_rows_cols_with_default(
         HISTOGRAM_HEIGHT,
         HISTOGRAM_WIDTH,
         CV_8UC3,
-        Scalar::all(0.0),
+        Scalar::from_array([
+            histogram_background[2] as _,
+            histogram_background[1] as _,
+            histogram_background[0] as _,
+            0.0,
+        ]),
     )
     .unwrap();
 
     let mut display_delay = Instant::now();
     let mut sample_delay = Instant::now();
     let mut sample = 0.0;
-    let mut last_region = Rect::default();
 
     let mut min_hist = 0.0;
     let mut max_hist = 0.0;
@@ -82,9 +84,10 @@ fn main() {
     let color_red = Scalar::new(0.0, 0.0, 255.0, -1.0);
     let color_green = Scalar::new(0.0, 255.0, 0.0, -1.0);
 
-    while let Ok(FrameNotification::NewFrame { fps }) = new_frame_notification.recv() {
-        println!("Camera FPS: {fps}");
+    let sample_history_length = 90;
+    let mut sample_history = VecDeque::with_capacity(sample_history_length);
 
+    while let Ok(FrameNotification::NewFrame { fps }) = new_frame_notification.recv() {
         let mut bgr_buffer = match camera.frame() {
             None => {
                 eprintln!("Got an empty buffer");
@@ -108,74 +111,60 @@ fn main() {
         };
 
         if let Some(region) = last_detection {
-            draw_box_around_face(&mut bgr_buffer, region.clone(), &color).unwrap();
             let roi = Mat::roi(&bgr_buffer, region).unwrap();
             let mean = mean(&roi, &no_array()).unwrap();
 
             // Sample and hold.
             sample = mean[1] / 255.0;
-        }
 
-        let tbf = Instant::now() - sample_delay;
-        if tbf.as_millis() >= 60 {
-            let fps = 1.0 / tbf.as_secs_f64();
-            sample_delay = Instant::now();
-            println!("x FPS: {} ({:?})", fps, tbf);
-
-            stft.append_samples(&[sample]);
-
-            while stft.contains_enough_to_compute() {
-                stft.compute_column(&mut spectrogram_column[..]);
-                stft.move_to_next_column();
-
-                let row = histogram_buffer
-                    .at_row_mut::<Vec3b>(HISTOGRAM_HEIGHT - 1)
-                    .unwrap();
-
-                let mut min = f64::MAX;
-                let mut max = f64::MIN;
-
-                for &value in &spectrogram_column {
-                    min = min.min(value);
-                    max = max.max(value);
-                }
-
-                if max <= 1e-4 {
-                    max = 1.0;
-                }
-
-                min = min * 0.9 + min_hist * 0.1;
-                max = max * 0.9 + max_hist * 0.1;
-
-                min_hist = min;
-                max_hist = max;
-
-                println!("min={min}, max={max}");
-
-                const SKIP: usize = 10;
-                const N: usize = HISTOGRAM_WIDTH as usize - SKIP;
-                for (i, &value) in spectrogram_column.iter().skip(SKIP).take(N).enumerate() {
-                    let sample = ((value - min) / max + min).min(1.0);
-                    let color = palette.at(sample);
-                    let rgb = color.to_rgba8();
-
-                    let j = ((i as f64) / (N as f64) * (HISTOGRAM_WIDTH as f64)) as usize;
-                    row[j] = Vec3b::from_array([rgb[2], rgb[1], rgb[0]]);
-                }
+            // Keep a moving average range.
+            if sample_history.len() == sample_history_length {
+                sample_history.pop_front();
             }
+            sample_history.push_back(sample);
+            let min = sample_history
+                .iter()
+                .min_by(|&x, &y| x.partial_cmp(y).unwrap_or(Ordering::Equal))
+                .unwrap();
+            let max = sample_history
+                .iter()
+                .max_by(|&x, &y| x.partial_cmp(y).unwrap_or(Ordering::Equal))
+                .unwrap();
 
-            let src = Mat::roi(
-                &histogram_buffer,
-                Rect::new(0, 1, HISTOGRAM_WIDTH, HISTOGRAM_HEIGHT - 1),
+            let sample_adjusted = (sample - min) / (max - min);
+
+            sample_spectrogram.sample_and_hold(sample_adjusted);
+            println!("Sample: {sample_adjusted:.4} ({sample:.6} in {min:.6} .. {max:.6})");
+
+            draw_box_around_face(&mut bgr_buffer, region, &color).unwrap();
+
+            rectangle(
+                &mut bgr_buffer,
+                Rect::new(
+                    0,
+                    (CAMERA_CAPTURE_HEIGHT as f64 - CAMERA_CAPTURE_HEIGHT as f64 * sample_adjusted)
+                        as _,
+                    5,
+                    (CAMERA_CAPTURE_HEIGHT as i32 - HISTOGRAM_HEIGHT) as _,
+                ),
+                Scalar::from_array([0.0, 0.0, 255.0, 0.0]),
+                FILLED,
+                LINE_4,
+                0,
             )
             .unwrap();
-            let mut dst = Mat::roi(
-                &histogram_buffer,
-                Rect::new(0, 0, HISTOGRAM_WIDTH, HISTOGRAM_HEIGHT - 1),
-            )
-            .unwrap();
-            src.copy_to(&mut dst).unwrap();
         }
+
+        update_spectrogram_display(
+            &palette,
+            &sample_spectrogram,
+            &mut histogram_buffer,
+            &mut sample_delay,
+            &mut min_hist,
+            &mut max_hist,
+            min_idx,
+            max_idx,
+        );
 
         let mut histogram_region = Mat::roi(
             &bgr_buffer,
@@ -199,6 +188,82 @@ fn main() {
             }
         }
     }
+}
+
+fn update_spectrogram_display(
+    palette: &Gradient,
+    sample_spectrogram: &SampleSpectrogram,
+    mut histogram_buffer: &mut Mat,
+    sample_delay: &mut Instant,
+    min_hist: &mut f64,
+    max_hist: &mut f64,
+    min_idx: usize,
+    max_idx: usize,
+) {
+    let tbf = Instant::now() - *sample_delay;
+    if tbf.as_millis() >= 30 {
+        *sample_delay = Instant::now();
+
+        let mut spectrogram_column = Vec::new();
+        sample_spectrogram.copy_spectrogram_into(&mut spectrogram_column);
+
+        let row = histogram_buffer
+            .at_row_mut::<Vec3b>(HISTOGRAM_HEIGHT - 1)
+            .unwrap();
+
+        let mut min = f64::MAX;
+        let mut max = f64::MIN;
+
+        let skip = min_idx;
+        let take_n = max_idx - min_idx;
+        for &value in spectrogram_column.iter().skip(skip).take(take_n) {
+            min = min.min(value);
+            max = max.max(value);
+        }
+
+        if max <= 1e-4 {
+            max = 1.0;
+        }
+
+        min = min * 0.9 + *min_hist * 0.1;
+        max = max * 0.9 + *max_hist * 0.1;
+
+        *min_hist = min;
+        *max_hist = max;
+
+        // println!("min={min}, max={max}");
+
+        for (i, &value) in spectrogram_column
+            .iter()
+            .skip(skip)
+            .take(take_n)
+            .enumerate()
+        {
+            let sample = (value - min) / (max - min);
+            // let sample = value;
+            let color = palette.at(sample);
+            let rgb = color.to_rgba8();
+
+            let j = ((i as f64) / (take_n as f64) * (HISTOGRAM_WIDTH as f64)) as usize;
+            row[j] = Vec3b::from_array([rgb[2], rgb[1], rgb[0]]);
+        }
+
+        shift_spectrogram(&mut histogram_buffer);
+    }
+}
+
+fn shift_spectrogram(histogram_buffer: &mut Mat) {
+    let src = Mat::roi(
+        &histogram_buffer,
+        Rect::new(0, 1, HISTOGRAM_WIDTH, HISTOGRAM_HEIGHT - 1),
+    )
+    .unwrap();
+    let mut dst = Mat::roi(
+        &histogram_buffer,
+        Rect::new(0, 0, HISTOGRAM_WIDTH, HISTOGRAM_HEIGHT - 1),
+    )
+    .unwrap();
+    src.copy_to(&mut dst).unwrap();
 }
 
 fn draw_box_around_face(frame: &mut Mat, face: Rect, color: &Scalar) -> Result<(), opencv::Error> {
