@@ -4,7 +4,7 @@ use nokhwa::utils::{
     CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
 };
 use nokhwa::{Camera, NokhwaError};
-use opencv::core::{no_array, Scalar, CV_8UC3};
+use opencv::core::{Scalar, CV_8UC3};
 use opencv::imgproc::{cvt_color, COLOR_RGB2BGR};
 use opencv::prelude::*;
 use std::cell::Cell;
@@ -106,7 +106,7 @@ impl CameraCapture {
 
         let mut fps = FpsCounter::new();
         while !cancellation.load(Ordering::Acquire) {
-            let mut frame = camera
+            let frame = camera
                 .frame()
                 .map_err(|e| ThreadError::CameraCaptureFailed(e))?;
 
@@ -130,7 +130,7 @@ impl CameraCapture {
             cvt_color(&capture_buffer, &mut bgr_buffer, COLOR_RGB2BGR, 3)
                 .map_err(|e| ThreadError::OpenCvError(e))?;
 
-            let target_buffer = target_buffer.lock().map_err(|e| ThreadError::LockError)?;
+            let target_buffer = target_buffer.lock().map_err(|_e| ThreadError::LockError)?;
 
             // Swap the buffer and notify.
             target_buffer.set(Some(bgr_buffer));
@@ -157,7 +157,6 @@ impl Drop for CameraCapture {
 
 pub enum FrameNotification {
     NewFrame { fps: f32 },
-    Error,
     Stopped,
 }
 

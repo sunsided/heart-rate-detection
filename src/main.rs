@@ -21,21 +21,11 @@ use std::time::{Duration, Instant};
 const KEY_CODE_ESCAPE: i32 = 27;
 const CASCADE_XML_FILE: &str = "haarcascade_frontalface_alt.xml";
 
-const CAMERA_CAPTURE_WIDTH: u32 = 640;
-const CAMERA_CAPTURE_HEIGHT: u32 = 480;
-const CAMERA_CAPTURE_IDEAL_FPS: u32 = 30;
-
-// Reduced-size image dimensions for face detection
-const SCALE_FACTOR: f64 = 0.5_f64;
-const SCALE_FACTOR_INV: i32 = (1f64 / SCALE_FACTOR) as i32;
-
 const HISTOGRAM_WIDTH: i32 = 640;
 const HISTOGRAM_HEIGHT: i32 = 100;
 
-const IOU_THRESHOLD: f32 = 0.8;
-
 const MIN_IBI_FREQ: f64 = 0.5;
-const MAX_IBI_FREQ: f64 = 10.0;
+const MAX_IBI_FREQ: f64 = 1.5;
 
 // TODO: Impractical but fun: Use optical flow to adjust the detected face until the next guess comes in.
 
@@ -74,7 +64,6 @@ fn main() {
 
     let mut display_delay = Instant::now();
     let mut sample_delay = Instant::now();
-    let mut sample = 0.0;
 
     let mut min_hist = 0.0;
     let mut max_hist = 0.0;
@@ -86,8 +75,9 @@ fn main() {
 
     let sample_history_length = 90;
     let mut sample_history = VecDeque::with_capacity(sample_history_length);
+    let mut sample_count = 0;
 
-    while let Ok(FrameNotification::NewFrame { fps }) = new_frame_notification.recv() {
+    while let Ok(FrameNotification::NewFrame { fps: _fps }) = new_frame_notification.recv() {
         let mut bgr_buffer = match camera.frame() {
             None => {
                 eprintln!("Got an empty buffer");
@@ -115,7 +105,7 @@ fn main() {
             let mean = mean(&roi, &no_array()).unwrap();
 
             // Sample and hold.
-            sample = mean[1] / 255.0;
+            let sample = mean[1] / 255.0;
 
             // Keep a moving average range.
             if sample_history.len() == sample_history_length {
@@ -131,10 +121,11 @@ fn main() {
                 .max_by(|&x, &y| x.partial_cmp(y).unwrap_or(Ordering::Equal))
                 .unwrap();
 
+            sample_count += 1;
             let sample_adjusted = (sample - min) / (max - min);
 
             sample_spectrogram.sample_and_hold(sample_adjusted);
-            println!("Sample: {sample_adjusted:.4} ({sample:.6} in {min:.6} .. {max:.6})");
+            println!("Sample #{sample_count:5}: {sample_adjusted:.4} ({sample:.6} in {min:.6} .. {max:.6})");
 
             draw_box_around_face(&mut bgr_buffer, region, &color).unwrap();
 
@@ -142,10 +133,11 @@ fn main() {
                 &mut bgr_buffer,
                 Rect::new(
                     0,
-                    (CAMERA_CAPTURE_HEIGHT as f64 - CAMERA_CAPTURE_HEIGHT as f64 * sample_adjusted)
+                    (CameraCapture::CAMERA_CAPTURE_HEIGHT as f64
+                        - CameraCapture::CAMERA_CAPTURE_HEIGHT as f64 * sample_adjusted)
                         as _,
                     5,
-                    (CAMERA_CAPTURE_HEIGHT as i32 - HISTOGRAM_HEIGHT) as _,
+                    (CameraCapture::CAMERA_CAPTURE_HEIGHT as i32 - HISTOGRAM_HEIGHT) as _,
                 ),
                 Scalar::from_array([0.0, 0.0, 255.0, 0.0]),
                 FILLED,
@@ -207,10 +199,6 @@ fn update_spectrogram_display(
         let mut spectrogram_column = Vec::new();
         sample_spectrogram.copy_spectrogram_into(&mut spectrogram_column);
 
-        let row = spectrogram_buffer
-            .at_row_mut::<Vec3b>(HISTOGRAM_HEIGHT - 1)
-            .unwrap();
-
         let mut min = f64::MAX;
         let mut max = f64::MIN;
 
@@ -231,7 +219,11 @@ fn update_spectrogram_display(
         *min_hist = min;
         *max_hist = max;
 
-        // println!("min={min}, max={max}");
+        let row = spectrogram_buffer
+            .at_row_mut::<Vec3b>(HISTOGRAM_HEIGHT - 1)
+            .unwrap();
+
+        let bin_width = (1.0 / (take_n as f64) * (HISTOGRAM_WIDTH as f64)) as usize;
 
         for (i, &value) in spectrogram_column
             .iter()
@@ -245,7 +237,9 @@ fn update_spectrogram_display(
             let rgb = color.to_rgba8();
 
             let j = ((i as f64) / (take_n as f64) * (HISTOGRAM_WIDTH as f64)) as usize;
-            row[j] = Vec3b::from_array([rgb[2], rgb[1], rgb[0]]);
+            for j in j..(j + bin_width) {
+                row[j] = Vec3b::from_array([rgb[2], rgb[1], rgb[0]]);
+            }
         }
 
         shift_spectrogram(&mut spectrogram_buffer);
